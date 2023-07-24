@@ -47,7 +47,6 @@ class file_receiver:
                 ack_packet, self.sendto_addr = self.s.recvfrom(ACK_PACKET_SIZE)
                 unpacked_ack_packet = ack_packet_struct.unpack(ack_packet)
                 self.sendto_addr = (self.sendto_addr[0],unpacked_ack_packet[2])
-                #print("!!!!",self.sendto_addr)
                 self.s.sendto(ack_packet_struct.pack(*(self.seq,unpacked_ack_packet[0],0)),self.sendto_addr)
                 self.seq += 1
 
@@ -83,7 +82,7 @@ class file_receiver:
             except socket.timeout:
                 break
             
-            r_seq, r_ack, r_transflag, data = data_packet_struct.unpack(data_packet)
+            r_seq, r_len, r_transflag, data = data_packet_struct.unpack(data_packet)
 
             if r_transflag == 3:
                 self.s.sendto(ack_packet_struct.pack(*(self.seq,r_seq,self.rwnd)), self.sendto_addr)
@@ -91,7 +90,6 @@ class file_receiver:
 
             self.s.sendto(ack_packet_struct.pack(*(self.seq,r_seq,self.rwnd)), self.sendto_addr)
             self.seq += 1
-            # print(r_seq)
         
             if r_seq < self.recv_base + self.receive_buf_size and r_seq >= self.recv_base:
                 self.receive_queue[r_seq - self.recv_base] = data
@@ -100,15 +98,13 @@ class file_receiver:
             if r_transflag == 2:
                 self.end_seq = r_seq
             
-            start = time.time()
             while self.receive_queue[0] != None:
-                if self.recv_base == self.end_seq:
-                    self.receive_queue[0] = self.receive_queue[0].rstrip(b'\x00')
-                self.file.write(self.receive_queue[0])
+                self.file.write(self.receive_queue[0][0:r_len])
                 self.receive_queue.pop(0)
                 self.receive_queue.append(None)
                 self.recv_base += 1
                 self.rwnd += 1
+
         file_md5 = get_file_md5(self.file)
         if file_md5 != self.target_file_md5:
             print("target md5: ",self.target_file_md5)

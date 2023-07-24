@@ -21,7 +21,6 @@ class file_sender:
         self.sender_port = self.s.getsockname()[1]
         self.is_server = is_server
         self.seq_to_ack = seq_to_ack
-        #self.seq_base = 0
         
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_BUF_SIZE)
         self.s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUF_SIZE)
@@ -76,29 +75,23 @@ class file_sender:
         self.send_base = 0
         self.next_seq_num = 0
         self.is_end = False
-        self.pipeline_can_send = True
-        self.have_timer = False #GBN
         self.cwnd = 1.0
         self.ssthresh = 1024.0
-        self.dup_ack_cnt = 0
         self.rtt = 0.2
         self.timer_delay = 1.5 * self.rtt
         self.state = STATE_SS
         self.exit = False
         self.cnt = 0
         self.len = 0
+        self.last_re = -1
 
         # start send data and receive ack by thread
         self.send_thread = threading.Thread(target=self.send_data)
-        #self.recv_thread = threading.Thread(target=self.recv_ack)
         self.send_thread.start()
-        #self.recv_thread.start()
         self.send_thread.join()
-        #self.recv_thread.join()
     
     def send_data(self):
         # load file to buffer for MSS split & send
-        #self.s.settimeout(0.1)
         print("# load file to buffer for MSS split & send")
         file_buf = []
         file_size = 0
@@ -121,6 +114,7 @@ class file_sender:
                     data_pack = data_packet_struct.pack(*(0,0,3,b''))
                     self.Task.sendto(self.s, data_pack, self.sendto_addr)
                 else:
+                    # send some data packet out
                     for i in range(swnd-self.len):
                         if self.is_end == True:
                             break
@@ -129,7 +123,9 @@ class file_sender:
                         if self.next_seq_num == len(file_buf)-1:
                             self.is_end = True
                             trans_flag = 2
-                        data_pack = data_packet_struct.pack(*(self.next_seq_num,self.seq_to_ack,trans_flag,data))
+                        
+                        length = len(data)
+                        data_pack = data_packet_struct.pack(*(self.next_seq_num,length,trans_flag,data))
                         self.Task.sendto(self.s, data_pack, self.sendto_addr)
                         t = time.time()
                         self.send_queue.append(data_pack)
@@ -140,9 +136,9 @@ class file_sender:
                         self.next_seq_num += 1
             self.lock.release()
           
+            # receive ack
             ack_packet, self.sendto_addr = self.s.recvfrom(ACK_PACKET_SIZE)
             r_seq, r_ack, r_rwnd = ack_packet_struct.unpack(ack_packet)
-            #print("     ack:",r_ack)
             if r_seq == 0:
                 self.rwnd = r_rwnd
                 break
@@ -150,81 +146,40 @@ class file_sender:
             self.seq_to_ack = r_seq
             self.rwnd = r_rwnd
 
-            # FSM of congestion control
+            # for new ack
             self.lock.acquire()
             if r_ack >= self.send_base:
                 self.handle_new_ack(r_ack)
-                # if r_ack == self.next_seq_num-1:
-                #     break
             self.lock.release()
 
-                # client send end msg
+            # after received all ack
             if self.exit == True:
                 self.Task.finish()
                 print("client: ",self.sendto_addr," has received the whole file: ",self.filename, " connection end")
+                print("drop rate: ",(self.cnt/((self.Task.file_size+MSS-1)//MSS)))
                 self.s.close()
-                return
-            
+                return      
 
     def retransmit(self, seq):
-        #print("retransmit")
         self.lock.acquire()
         if seq - self.send_base < 0:
             self.lock.release()
             return
-        #self.cnt+=1
-        #print(self.cnt)
+        self.cnt += 1
         self.Task.sendto(self.s, self.send_queue[seq - self.send_base], self.sendto_addr)
         timer = threading.Timer(interval=self.timer_delay, function=self.retransmit, args=(seq,))
         self.timer_queue[seq - self.send_base] = (timer,-1)
+        # -1 means retransmit pack need not calculate rtt
         timer.start()
-        self.ssthresh = max(self.cwnd / 2, 16)
-        self.cwnd = 1.0
-        self.state = STATE_SS
+        if self.last_re == -1 or abs(self.last_re - seq) > 16:
+            self.ssthresh = max(self.cwnd / 2, 16)
+            self.cwnd = 1.0
+            self.state = STATE_SS
+        self.last_re = seq
         self.lock.release() 
-
-    def recv_ack(self):
-        while True:
-            ack_packet, self.sendto_addr = self.s.recvfrom(ACK_PACKET_SIZE)
-            r_seq, r_ack, r_rwnd = ack_packet_struct.unpack(ack_packet)
-            #print("     ack:",r_ack)
-            self.seq_to_ack = r_seq
-
-            self.lock.acquire()
-
-            self.rwnd = r_rwnd
-
-            # FSM of congestion control
-            if self.state == STATE_SS:
-                #print("in ss")
-                if r_ack >= self.send_base:
-                    self.handle_new_ack(r_ack)
-                    if self.cwnd < self.ssthresh:
-                        self.cwnd += 1  
-                    else:
-                        self.state = STATE_CA
-                else:
-                    pass
-
-            elif self.state == STATE_CA:
-                #print("in ca")
-                if r_ack >= self.send_base:
-                    self.handle_new_ack(r_ack)
-                    self.cwnd += 1.0 / int(self.cwnd)
-                else:
-                    pass
-
-            self.lock.release()
-
-            # client send end msg
-            if self.exit == True:
-                self.Task.finish()
-                print("client: ",self.sendto_addr," has received the whole file: ",self.filename, " connection end")
-                self.s.close()
-                return
                 
-    def handle_new_ack(self, r_ack): # irralated to congestion strategy
-        #print(r_ack)
+    def handle_new_ack(self, r_ack):
+        # FSM of congestion control
         if self.state == STATE_SS:
             if self.cwnd < self.ssthresh:
                 self.cwnd += 1  
@@ -234,8 +189,10 @@ class file_sender:
         elif self.state == STATE_CA:
             self.cwnd += 1.0 / int(self.cwnd)
 
+        # cancel timer
         if self.timer_queue[r_ack - self.send_base][0] != None:
             self.timer_queue[r_ack - self.send_base][0].cancel()
+            # -1 means retransmit pack need not calculate rtt
             if self.timer_queue[r_ack - self.send_base][1] != -1:
                 new_rtt = time.time() - self.timer_queue[r_ack - self.send_base][1]
                 self.rtt = 0.875 * self.rtt + 0.125 * new_rtt
@@ -243,6 +200,7 @@ class file_sender:
             self.timer_queue[r_ack - self.send_base] = (None,-1)    
             self.len -= 1
 
+        # slide queue
         if r_ack == self.send_base:
             while len(self.timer_queue) != 0 and self.timer_queue[0][0] == None:
                 self.send_base += 1
